@@ -21,7 +21,7 @@ jobs:
 
       - name: Publish (single exe, self-contained)
         run: >
-          dotnet publish MineHint/MineHint.csproj
+          dotnet publish MineHint.csproj
           -c Release
           -r win-x64
           --self-contained true
