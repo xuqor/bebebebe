@@ -3,7 +3,6 @@ name: Build MineHint
 on:
   push:
     branches: [ main, master ]
-  pull_request:
   workflow_dispatch:
 
 jobs:
@@ -19,16 +18,8 @@ jobs:
         with:
           dotnet-version: 8.0.x
 
-      - name: Publish (single exe, self-contained)
-        run: >
-          dotnet publish MineHint.csproj
-          -c Release
-          -r win-x64
-          --self-contained true
-          -p:TargetFramework=net8.0-windows
-          -p:PublishSingleFile=true
-          -p:IncludeNativeLibrariesForSelfExtract=true
-          -o out
+      - name: Publish
+        run: dotnet publish MineHint.csproj -c Release -o out
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
