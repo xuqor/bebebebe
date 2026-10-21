@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Imaging;
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Windows.Forms;
@@ -56,6 +57,7 @@ namespace MineHint
         byte[] capBuf, prevBuf;
         int[,] candidate;
         bool dirty;
+        string lastError;
 
         public ControlForm()
         {
@@ -93,6 +95,13 @@ namespace MineHint
             FormClosing += delegate { timer.Stop(); overlay.Close(); };
         }
 
+        void Fail(string text)
+        {
+            lastError = text;
+            status.Text = text;
+            MessageBox.Show(this, text, "MineHint", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+
         // ---------- шаг 1: клики + калибровка ----------
         void PickAndCalibrate()
         {
@@ -114,9 +123,9 @@ namespace MineHint
             if (pX < 8 || pY < 8 || pX > 80 || pY > 80)
             {
                 Show();
-                status.Text = "Размер клеток получился странным (" + pX.ToString("F1") + " x " + pY.ToString("F1") +
-                              " px). Проверь число столбцов/строк и кликни именно в центры угловых клеток: " +
-                              "сначала левая верхняя, потом правая нижняя.";
+                Fail("Размер клеток получился странным (" + pX.ToString("F1") + " x " + pY.ToString("F1") +
+                     " px). Проверь число столбцов/строк и кликни именно в центры угловых клеток: " +
+                     "сначала левая верхняя, потом правая нижняя.");
                 return;
             }
 
@@ -128,13 +137,28 @@ namespace MineHint
 
             Frame f;
             try { f = Grab(); }
-            catch (Exception ex) { Show(); status.Text = "Не удалось сделать снимок экрана: " + ex.Message; return; }
+            catch (Exception ex) { Show(); Fail("Не удалось сделать снимок экрана: " + ex.Message); return; }
 
             string err;
             BoardModel m = BoardModel.Calibrate(f, cols, rows, hOx, hOy, pX, pY, out err);
             Show();
-            if (m == null) { model = null; status.Text = err; return; }
+            if (m == null)
+            {
+                model = null;
+                string saved = "";
+                try
+                {
+                    string path = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Desktop), "minehint_debug.png");
+                    capBmp.Save(path, ImageFormat.Png);
+                    saved = "\r\n\r\nСнимок области сохранён на рабочий стол: minehint_debug.png";
+                }
+                catch { }
+                Fail(err + "\r\n\r\nОбласть: " + area.Width + "x" + area.Height + " px, клетка по кликам: " +
+                     pX.ToString("F1") + " x " + pY.ToString("F1") + " px, поле " + cols + "x" + rows + "." + saved);
+                return;
+            }
 
+            lastError = null;
             model = m; modelCols = cols; modelRows = rows;
             status.Text = "Готово: клетка " + m.CellW + "x" + m.CellH + " px, совпадение " + (int)(m.Match * 100) + "%." +
                           (m.Match < 0.9 ? "\r\nПохоже, не все клетки были закрыты. Если так, начни новую игру и повтори шаг 1." : "") +
@@ -152,7 +176,13 @@ namespace MineHint
                 btnRun.Text = "2. Старт";
                 return;
             }
-            if (model == null) { status.Text = "Сначала выполни шаг 1."; return; }
+            if (model == null)
+            {
+                status.Text = lastError != null
+                    ? "Шаг 1 не удался, причина:\r\n" + lastError
+                    : "Сначала выполни шаг 1.";
+                return;
+            }
             if ((int)numCols.Value != modelCols || (int)numRows.Value != modelRows)
             { status.Text = "Размер поля изменился, повтори шаг 1."; return; }
             if (Bounds.IntersectsWith(area))
