@@ -25,13 +25,35 @@ namespace MineHint
 
     static class Native
     {
-        [DllImport("user32.dll")]
-        static extern bool SetWindowDisplayAffinity(IntPtr hWnd, uint affinity);
+        [DllImport("user32.dll")] static extern bool SetWindowDisplayAffinity(IntPtr hWnd, uint affinity);
+        [DllImport("user32.dll")] static extern bool SetCursorPos(int x, int y);
+        [DllImport("user32.dll")] static extern short GetAsyncKeyState(int vKey);
+        [DllImport("user32.dll")] static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct MOUSEINPUT { public int dx; public int dy; public uint mouseData; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
+        [StructLayout(LayoutKind.Sequential)]
+        struct INPUT { public uint type; public MOUSEINPUT mi; }
 
         // Windows 10 2004+: окно не попадает в скриншоты (оверлей не мешает распознаванию)
         public static void ExcludeFromCapture(IntPtr handle)
         {
             try { SetWindowDisplayAffinity(handle, 0x11); } catch { }
+        }
+
+        public static bool KeyDown(int vk)
+        {
+            return (GetAsyncKeyState(vk) & 0x8000) != 0;
+        }
+
+        public static void LeftClick(int x, int y)
+        {
+            SetCursorPos(x, y);
+            Thread.Sleep(8);
+            var inp = new INPUT[2];
+            inp[0].type = 0; inp[0].mi.dwFlags = 0x0002;   // LEFTDOWN
+            inp[1].type = 0; inp[1].mi.dwFlags = 0x0004;   // LEFTUP
+            SendInput(2, inp, Marshal.SizeOf(typeof(INPUT)));
         }
     }
 
@@ -58,6 +80,10 @@ namespace MineHint
         int[,] candidate;
         bool dirty;
         string lastError;
+        SolveResult lastRes;        // решение для текущего устоявшегося кадра
+        bool resultValid;
+        int openCells;
+        int lastClickSig = int.MinValue;
 
         public ControlForm()
         {
@@ -88,7 +114,7 @@ namespace MineHint
             Controls.Add(l1); Controls.Add(numCols); Controls.Add(l2); Controls.Add(numRows);
             Controls.Add(btnPick); Controls.Add(btnRun); Controls.Add(status);
 
-            timer.Interval = 250;
+            timer.Interval = 120;
             timer.Tick += delegate { Tick(); };
             btnPick.Click += delegate { PickAndCalibrate(); };
             btnRun.Click += delegate { ToggleRun(); };
@@ -202,7 +228,7 @@ namespace MineHint
             prevBuf = null; candidate = null; dirty = false;
             running = true;
             btnRun.Text = "2. Стоп";
-            status.Text = "Работает. Зелёные квадраты - безопасные клетки, красные - мины." +
+            status.Text = "Работает. Зелёные квадраты - безопасные клетки, красные - мины.\r\nЗажми и держи Z - автоигра (клики по безопасным клеткам)." +
                           (overlayInCapture ? "\r\n(режим совместимости: подсветка слегка мигает)" : "");
             timer.Start();
         }
@@ -242,14 +268,57 @@ namespace MineHint
         }
 
         // ---------- основной цикл ----------
+        static int GridSig(int[,] g)
+        {
+            int h = 17;
+            foreach (int v in g) h = h * 31 + v;
+            return h;
+        }
+
+        // Автоигра: кликаем по безопасным клеткам, пока зажата клавиша Z
+        bool AutoplayClick()
+        {
+            if (!resultValid || lastRes == null || candidate == null) return false;
+            var ids = new List<int>(lastRes.Safe);
+            if (openCells == 0) { ids.Clear(); ids.Add((modelRows / 2) * modelCols + modelCols / 2); }   // первый ход - в центр
+            if (ids.Count == 0) return false;
+
+            int sig = GridSig(candidate);
+            if (sig == lastClickSig)
+            {
+                status.Text = "Клик не изменил поле. Если на безопасной клетке стоит флаг, сними его. " +
+                              "Отпусти и снова нажми Z, чтобы повторить.";
+                return false;
+            }
+            lastClickSig = sig;
+
+            Point saved = Cursor.Position;
+            foreach (int id in ids)
+            {
+                int r = id / modelCols, c = id % modelCols;
+                Native.LeftClick(area.X + model.CellX(c) + model.CellW / 2,
+                                 area.Y + model.CellY(r) + model.CellH / 2);
+                Thread.Sleep(12);
+            }
+            Cursor.Position = saved;
+
+            overlay.SetMarks(new HashSet<int>(), new HashSet<int>());
+            resultValid = false; prevBuf = null; dirty = false; candidate = null;
+            Thread.Sleep(60);
+            return true;
+        }
+
         void Tick()
         {
+            bool z = Native.KeyDown(0x5A);          // клавиша Z
+            if (!z) lastClickSig = int.MinValue;
+
             if (Bounds.IntersectsWith(area))
             {
                 // окно закрывает поле - клетки под ним прочитаются неверно, поэтому не гадаем
                 overlay.SetMarks(new HashSet<int>(), new HashSet<int>());
                 status.Text = "Окно MineHint закрывает поле. Передвинь его в сторону, подсветка на паузе.";
-                prevBuf = null; dirty = false;
+                prevBuf = null; dirty = false; resultValid = false;
                 return;
             }
 
@@ -269,41 +338,66 @@ namespace MineHint
                 Buffer.BlockCopy(capBuf, 0, prevBuf, 0, capBuf.Length);
                 candidate = model.ReadGrid(f);
                 dirty = true;
+                resultValid = false;
                 return;
             }
-            if (!dirty) return;         // ничего нового
+
+            if (!dirty)
+            {
+                if (z && AutoplayClick()) return;
+                return;
+            }
             dirty = false;
 
-            int open = 0;
+            openCells = 0;
+            int unknown = 0;
             for (int r = 0; r < modelRows; r++)
-                for (int c = 0; c < modelCols; c++) if (candidate[r, c] != -1) open++;
-            if (open == 0)
+                for (int c = 0; c < modelCols; c++)
+                {
+                    if (candidate[r, c] != -1) openCells++;
+                    if (candidate[r, c] == -2) unknown++;
+                }
+
+            if (openCells == 0)
             {
+                lastRes = new SolveResult(); resultValid = true;
                 overlay.SetMarks(new HashSet<int>(), new HashSet<int>());
-                status.Text = "Поле закрыто. Открой любую клетку.";
+                status.Text = "Поле закрыто. Открой любую клетку (или зажми Z, я открою центральную).";
+                if (z) AutoplayClick();
                 return;
             }
 
-            SolveResult res = Solver.Solve(candidate, modelRows, modelCols);
+            // Клетки с неузнанной цифрой для решателя считаем закрытыми (так безопаснее: потеряем
+            // подсказку, но не получим ложный вывод), а из результата их убираем.
+            var sg = (int[,])candidate.Clone();
+            for (int r = 0; r < modelRows; r++)
+                for (int c = 0; c < modelCols; c++) if (sg[r, c] == -2) sg[r, c] = -1;
+            SolveResult res = Solver.Solve(sg, modelRows, modelCols);
+            if (!res.Inconsistent)
+                for (int r = 0; r < modelRows; r++)
+                    for (int c = 0; c < modelCols; c++)
+                        if (candidate[r, c] == -2) { res.Safe.Remove(r * modelCols + c); res.Mines.Remove(r * modelCols + c); }
             if (res.Inconsistent)
             {
+                resultValid = false;
                 overlay.SetMarks(new HashSet<int>(), new HashSet<int>());
-                status.Text = "Не могу надёжно прочитать поле, подсветка отключена. Возможные причины: " +
+                status.Text = "Не могу надёжно прочитать поле, подсветка и автоигра отключены. Возможные причины: " +
                               "игра закончена, окно перекрыто, другие цвета цифр или сдвинулось окно игры " +
                               "(тогда повтори шаг 1).";
                 return;
             }
+
+            lastRes = res; resultValid = true;
             overlay.SetMarks(res.Safe, res.Mines);
-            int unknown = 0;
-            for (int r = 0; r < modelRows; r++)
-                for (int c = 0; c < modelCols; c++) if (candidate[r, c] == -2) unknown++;
             if (res.Safe.Count == 0 && res.Mines.Count == 0)
                 status.Text = "Надёжных ходов нет, нужно угадывать.";
             else
-                status.Text = "Безопасных клеток (зелёные): " + res.Safe.Count + "\r\nМин (красные): " + res.Mines.Count;
+                status.Text = "Безопасных клеток (зелёные): " + res.Safe.Count + "\r\nМин (красные): " + res.Mines.Count +
+                              "\r\nЗажми Z - автоигра.";
             if (unknown > 0)
                 status.Text += "\r\nНе узнал цифру в клетках: " + unknown + " (другой цвет), они пропущены. " +
                                "Пришли скриншот этих цифр, добавлю цвета.";
+            if (z) AutoplayClick();
         }
     }
 
