@@ -2,9 +2,10 @@ using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Imaging;
-using System.Linq;
 using System.Runtime.InteropServices;
+using System.Threading;
 using System.Windows.Forms;
+using Timer = System.Windows.Forms.Timer;
 
 namespace MineHint
 {
@@ -13,317 +14,317 @@ namespace MineHint
         [STAThread]
         static void Main()
         {
+#if !MCSCHECK
             Application.SetHighDpiMode(HighDpiMode.SystemAware);
+#endif
             Application.EnableVisualStyles();
             Application.Run(new ControlForm());
         }
     }
 
-    // ---------- Окно управления ----------
+    static class Native
+    {
+        [DllImport("user32.dll")]
+        static extern bool SetWindowDisplayAffinity(IntPtr hWnd, uint affinity);
+
+        // Windows 10 2004+: окно не попадает в скриншоты (оверлей не мешает распознаванию)
+        public static void ExcludeFromCapture(IntPtr handle)
+        {
+            try { SetWindowDisplayAffinity(handle, 0x11); } catch { }
+        }
+    }
+
+    // ---------- Главное окно ----------
     class ControlForm : Form
     {
-        NumericUpDown numCols = new NumericUpDown { Minimum = 4, Maximum = 60, Value = 9 };
-        NumericUpDown numRows = new NumericUpDown { Minimum = 4, Maximum = 40, Value = 9 };
-        Button btnArea = new Button { Text = "1. Выбрать область поля" };
-        Button btnCalib = new Button { Text = "2. Калибровка (поле закрыто)" };
-        Button btnRun = new Button { Text = "3. Старт" };
-        Label status = new Label { AutoSize = false };
+        NumericUpDown numCols = new NumericUpDown();
+        NumericUpDown numRows = new NumericUpDown();
+        Button btnPick = new Button();
+        Button btnRun = new Button();
+        Label status = new Label();
+
+        Timer timer = new Timer();
+        OverlayForm overlay = new OverlayForm();
 
         Rectangle area = Rectangle.Empty;
-        Color closedColor = Color.Empty;
+        BoardModel model;
+        int modelCols, modelRows;
         bool running;
-        Timer timer = new Timer { Interval = 400 };
-        OverlayForm overlay = new OverlayForm();
+        bool overlayInCapture;      // true - оверлей виден в снимках, прячем его на время съёмки
+
+        Bitmap capBmp; Graphics capG;
+        byte[] capBuf, prevBuf;
+        int[,] candidate;
+        bool dirty;
 
         public ControlForm()
         {
             Text = "MineHint";
-            ClientSize = new Size(300, 250);
+            ClientSize = new Size(320, 270);
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = false;
             TopMost = true;
 
-            var l1 = new Label { Text = "Столбцов:", Left = 10, Top = 14, Width = 70 };
-            numCols.SetBounds(90, 10, 60, 24);
-            var l2 = new Label { Text = "Строк:", Left = 160, Top = 14, Width = 50 };
-            numRows.SetBounds(215, 10, 60, 24);
-            btnArea.SetBounds(10, 50, 280, 32);
-            btnCalib.SetBounds(10, 90, 280, 32);
-            btnRun.SetBounds(10, 130, 280, 32);
-            status.SetBounds(10, 172, 280, 70);
-            status.Text = "Сначала укажи размер поля (новичок 9x9, любитель 16x16, эксперт 30x16), " +
-                          "затем выбери область.";
-            Controls.AddRange(new Control[] { l1, numCols, l2, numRows, btnArea, btnCalib, btnRun, status });
+            numCols.Minimum = 4; numCols.Maximum = 60; numCols.Value = 9;
+            numRows.Minimum = 4; numRows.Maximum = 40; numRows.Value = 9;
 
-            btnArea.Click += (s, e) => PickArea();
-            btnCalib.Click += (s, e) => Calibrate();
-            btnRun.Click += (s, e) => ToggleRun();
-            timer.Tick += (s, e) => Tick();
-            FormClosing += (s, e) => overlay.Close();
+            var l1 = new Label(); l1.Text = "Столбцов:"; l1.SetBounds(10, 14, 70, 20);
+            numCols.SetBounds(85, 10, 60, 24);
+            var l2 = new Label(); l2.Text = "Строк:"; l2.SetBounds(165, 14, 50, 20);
+            numRows.SetBounds(220, 10, 60, 24);
+
+            btnPick.Text = "1. Указать поле (2 клика)";
+            btnPick.SetBounds(10, 48, 300, 36);
+            btnRun.Text = "2. Старт";
+            btnRun.SetBounds(10, 92, 300, 36);
+
+            status.SetBounds(10, 140, 300, 120);
+            status.Text = "Размер поля: новичок 9x9, любитель 16x16, эксперт 30 столбцов x 16 строк.\r\n\r\n" +
+                          "Начни НОВУЮ игру (все клетки закрыты), нажми кнопку 1 и кликни в центр левой верхней, " +
+                          "а потом в центр правой нижней клетки.";
+
+            Controls.Add(l1); Controls.Add(numCols); Controls.Add(l2); Controls.Add(numRows);
+            Controls.Add(btnPick); Controls.Add(btnRun); Controls.Add(status);
+
+            timer.Interval = 250;
+            timer.Tick += delegate { Tick(); };
+            btnPick.Click += delegate { PickAndCalibrate(); };
+            btnRun.Click += delegate { ToggleRun(); };
+            FormClosing += delegate { timer.Stop(); overlay.Close(); };
         }
 
-        void PickArea()
+        // ---------- шаг 1: клики + калибровка ----------
+        void PickAndCalibrate()
         {
+            if (running) ToggleRun();
+            int cols = (int)numCols.Value, rows = (int)numRows.Value;
+
+            Point p1, p2;
             Hide();
-            using (var sel = new SelectForm())
+            using (var pick = new PointPickForm())
             {
-                if (sel.ShowDialog() == DialogResult.OK) area = sel.Selected;
+                if (pick.ShowDialog() != DialogResult.OK) { Show(); return; }
+                p1 = pick.P1; p2 = pick.P2;
             }
-            Show();
-            status.Text = area.IsEmpty ? "Область не выбрана."
-                : $"Область: {area.Width}x{area.Height}. Теперь калибровка на закрытом поле.";
-        }
+            Application.DoEvents();
+            Thread.Sleep(350);          // дать экрану перерисоваться без затемнения
 
-        void Calibrate()
-        {
-            if (area.IsEmpty) { status.Text = "Сначала выбери область."; return; }
-            using (var bmp = Capture(area))
+            double pX = (p2.X - p1.X) / (double)(cols - 1);
+            double pY = (p2.Y - p1.Y) / (double)(rows - 1);
+            if (pX < 8 || pY < 8 || pX > 80 || pY > 80)
             {
-                var px = new PixelBuffer(bmp);
-                float cw = area.Width / (float)numCols.Value;
-                float ch = area.Height / (float)numRows.Value;
-                closedColor = RingColor(px, 0, 0, cw, ch);
-            }
-            status.Text = "Калибровка готова. Жми «Старт» и играй.";
-        }
-
-        void ToggleRun()
-        {
-            if (area.IsEmpty || closedColor.IsEmpty)
-            {
-                status.Text = "Нужны область и калибровка.";
+                Show();
+                status.Text = "Размер клеток получился странным (" + pX.ToString("F1") + " x " + pY.ToString("F1") +
+                              " px). Проверь число столбцов/строк и кликни именно в центры угловых клеток: " +
+                              "сначала левая верхняя, потом правая нижняя.";
                 return;
             }
-            running = !running;
-            btnRun.Text = running ? "3. Стоп" : "3. Старт";
+
+            const int AM = 12;          // запас вокруг поля
+            int ax = (int)Math.Floor(p1.X - pX / 2 - AM), ay = (int)Math.Floor(p1.Y - pY / 2 - AM);
+            int aw = (int)Math.Round(cols * pX + 2 * AM), ah = (int)Math.Round(rows * pY + 2 * AM);
+            double hOx = (p1.X - pX / 2) - ax, hOy = (p1.Y - pY / 2) - ay;
+            area = new Rectangle(ax, ay, aw, ah);
+
+            Frame f;
+            try { f = Grab(); }
+            catch (Exception ex) { Show(); status.Text = "Не удалось сделать снимок экрана: " + ex.Message; return; }
+
+            string err;
+            BoardModel m = BoardModel.Calibrate(f, cols, rows, hOx, hOy, pX, pY, out err);
+            Show();
+            if (m == null) { model = null; status.Text = err; return; }
+
+            model = m; modelCols = cols; modelRows = rows;
+            status.Text = "Готово: клетка " + m.CellW + "x" + m.CellH + " px, совпадение " + (int)(m.Match * 100) + "%." +
+                          (m.Match < 0.9 ? "\r\nПохоже, не все клетки были закрыты. Если так, начни новую игру и повтори шаг 1." : "") +
+                          "\r\nТеперь жми «Старт».";
+        }
+
+        // ---------- шаг 2: старт / стоп ----------
+        void ToggleRun()
+        {
             if (running)
             {
-                overlay.Setup(area);
-                overlay.Show();
-                timer.Start();
-            }
-            else
-            {
+                running = false;
                 timer.Stop();
                 overlay.Hide();
+                btnRun.Text = "2. Старт";
+                return;
             }
+            if (model == null) { status.Text = "Сначала выполни шаг 1."; return; }
+            if ((int)numCols.Value != modelCols || (int)numRows.Value != modelRows)
+            { status.Text = "Размер поля изменился, повтори шаг 1."; return; }
+            if (Bounds.IntersectsWith(area))
+            { status.Text = "Окно MineHint закрывает поле. Передвинь его в сторону и снова жми «Старт»."; return; }
+
+            overlay.Setup(area, model);
+            overlay.ShowTest = true;
+            overlay.Show();
+            overlay.Refresh();
+            Application.DoEvents();
+            Thread.Sleep(200);
+            try
+            {
+                Frame f = Grab();
+                int cx = model.CellX(0) + model.CellW / 2, cy = model.CellY(0) + model.CellH / 2;
+                overlayInCapture = Col.Sq(f.Get(cx, cy), OverlayForm.SafeColor.ToArgb() & 0xFFFFFF) < 900;
+            }
+            catch { overlayInCapture = true; }
+            overlay.ShowTest = false;
+            overlay.SetMarks(new HashSet<int>(), new HashSet<int>());
+
+            prevBuf = null; candidate = null; dirty = false;
+            running = true;
+            btnRun.Text = "2. Стоп";
+            status.Text = "Работает. Зелёные квадраты - безопасные клетки, красные - мины." +
+                          (overlayInCapture ? "\r\n(режим совместимости: подсветка слегка мигает)" : "");
+            timer.Start();
         }
 
-        Bitmap Capture(Rectangle r)
+        // ---------- снимок экрана ----------
+        Frame Grab()
         {
-            // прячем оверлей, если он не исключается из захвата
-            bool hidden = false;
-            if (overlay.Visible && !overlay.ExcludedFromCapture) { overlay.Opacity = 0; hidden = true; }
-            var bmp = new Bitmap(r.Width, r.Height, PixelFormat.Format32bppArgb);
-            using (var g = Graphics.FromImage(bmp))
-                g.CopyFromScreen(r.Location, Point.Empty, r.Size);
-            if (hidden) overlay.Opacity = 1;
-            return bmp;
+            int w = area.Width, h = area.Height;
+            if (capBmp == null || capBmp.Width != w || capBmp.Height != h)
+            {
+                if (capG != null) capG.Dispose();
+                if (capBmp != null) capBmp.Dispose();
+                capBmp = new Bitmap(w, h, PixelFormat.Format32bppArgb);
+                capG = Graphics.FromImage(capBmp);
+                capBuf = new byte[w * h * 4];
+                prevBuf = null;
+            }
+            capG.CopyFromScreen(area.Location, Point.Empty, area.Size);
+            BitmapData bd = capBmp.LockBits(new Rectangle(0, 0, w, h), ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+            try
+            {
+                if (bd.Stride == w * 4) Marshal.Copy(bd.Scan0, capBuf, 0, capBuf.Length);
+                else for (int y = 0; y < h; y++) Marshal.Copy(IntPtr.Add(bd.Scan0, y * bd.Stride), capBuf, y * w * 4, w * 4);
+            }
+            finally { capBmp.UnlockBits(bd); }
+            return new Frame(w, h, capBuf);
         }
 
+        static bool SameBytes(byte[] a, byte[] b)
+        {
+            if (a.Length != b.Length) return false;
+            int n = a.Length / 8 * 8;
+            for (int i = 0; i < n; i += 8)
+                if (BitConverter.ToInt64(a, i) != BitConverter.ToInt64(b, i)) return false;
+            for (int i = n; i < a.Length; i++) if (a[i] != b[i]) return false;
+            return true;
+        }
+
+        // ---------- основной цикл ----------
         void Tick()
         {
-            int cols = (int)numCols.Value, rows = (int)numRows.Value;
-            int[,] grid = new int[rows, cols];
-            float cw = area.Width / (float)cols, ch = area.Height / (float)rows;
-
-            using (var bmp = Capture(area))
+            Frame f;
+            try
             {
-                var px = new PixelBuffer(bmp);
-                for (int r = 0; r < rows; r++)
-                    for (int c = 0; c < cols; c++)
-                        grid[r, c] = Classify(px, c, r, cw, ch);
+                if (overlayInCapture) { overlay.Opacity = 0; Thread.Sleep(40); }
+                f = Grab();
+            }
+            catch { return; }
+            finally { if (overlayInCapture) overlay.Opacity = 1; }
+
+            // кадр изменился - распознаём заново и ждём, пока картинка устоится (анимации, нажатия мыши)
+            if (prevBuf == null || !SameBytes(capBuf, prevBuf))
+            {
+                if (prevBuf == null) prevBuf = new byte[capBuf.Length];
+                Buffer.BlockCopy(capBuf, 0, prevBuf, 0, capBuf.Length);
+                candidate = model.ReadGrid(f);
+                dirty = true;
+                return;
+            }
+            if (!dirty) return;         // ничего нового
+            dirty = false;
+
+            int open = 0;
+            for (int r = 0; r < modelRows; r++)
+                for (int c = 0; c < modelCols; c++) if (candidate[r, c] >= 0) open++;
+            if (open == 0)
+            {
+                overlay.SetMarks(new HashSet<int>(), new HashSet<int>());
+                status.Text = "Поле закрыто. Открой любую клетку.";
+                return;
             }
 
-            var res = Solver.Solve(grid, rows, cols);
-            overlay.Update(rows, cols, res.Safe, res.Mines);
-        }
-
-        // -1 = закрыта, 0..8 = открыта с числом
-        int Classify(PixelBuffer px, int c, int r, float cw, float ch)
-        {
-            Color ring = RingColor(px, c, r, cw, ch);
-            if (Dist(ring, closedColor) < 45) return -1;
-
-            // открытая клетка: ищем цвет цифры в центре
-            int[] counts = new int[9];
-            int x0 = (int)(c * cw + cw * 0.25f), x1 = (int)(c * cw + cw * 0.75f);
-            int y0 = (int)(r * ch + ch * 0.25f), y1 = (int)(r * ch + ch * 0.75f);
-            for (int y = y0; y < y1; y++)
-                for (int x = x0; x < x1; x++)
-                {
-                    Color p = px.Get(x, y);
-                    for (int n = 1; n <= 8; n++)
-                        if (Dist(p, DigitColors[n]) < 60) counts[n]++;
-                }
-            int best = 0, bestCount = 3; // минимум 4 пикселя
-            for (int n = 1; n <= 8; n++)
-                if (counts[n] > bestCount) { bestCount = counts[n]; best = n; }
-            return best;
-        }
-
-        static readonly Color[] DigitColors =
-        {
-            Color.Empty,
-            Color.FromArgb(0, 0, 255),     // 1
-            Color.FromArgb(0, 128, 0),     // 2
-            Color.FromArgb(255, 0, 0),     // 3
-            Color.FromArgb(0, 0, 128),     // 4
-            Color.FromArgb(128, 0, 0),     // 5
-            Color.FromArgb(0, 128, 128),   // 6
-            Color.FromArgb(0, 0, 0),       // 7
-            Color.FromArgb(128, 128, 128), // 8
-        };
-
-        static Color RingColor(PixelBuffer px, int c, int r, float cw, float ch)
-        {
-            long sr = 0, sg = 0, sb = 0; int n = 0;
-            int x0 = (int)(c * cw), y0 = (int)(r * ch);
-            int w = (int)cw, h = (int)ch;
-            for (int i = 2; i < w - 2; i++)
+            SolveResult res = Solver.Solve(candidate, modelRows, modelCols);
+            if (res.Inconsistent)
             {
-                foreach (int y in new[] { y0 + 2, y0 + h - 3 })
-                { var p = px.Get(x0 + i, y); sr += p.R; sg += p.G; sb += p.B; n++; }
+                overlay.SetMarks(new HashSet<int>(), new HashSet<int>());
+                status.Text = "Не могу надёжно прочитать поле, подсветка отключена. Возможные причины: " +
+                              "игра закончена, окно перекрыто, другие цвета цифр или сдвинулось окно игры " +
+                              "(тогда повтори шаг 1).";
+                return;
             }
-            for (int j = 2; j < h - 2; j++)
-            {
-                foreach (int x in new[] { x0 + 2, x0 + w - 3 })
-                { var p = px.Get(x, y0 + j); sr += p.R; sg += p.G; sb += p.B; n++; }
-            }
-            if (n == 0) return Color.Black;
-            return Color.FromArgb((int)(sr / n), (int)(sg / n), (int)(sb / n));
-        }
-
-        static double Dist(Color a, Color b)
-        {
-            int dr = a.R - b.R, dg = a.G - b.G, db = a.B - b.B;
-            return Math.Sqrt(dr * dr + dg * dg + db * db);
+            overlay.SetMarks(res.Safe, res.Mines);
+            if (res.Safe.Count == 0 && res.Mines.Count == 0)
+                status.Text = "Надёжных ходов нет, нужно угадывать.";
+            else
+                status.Text = "Безопасных клеток (зелёные): " + res.Safe.Count + "\r\nМин (красные): " + res.Mines.Count;
         }
     }
 
-    // ---------- Быстрый доступ к пикселям ----------
-    class PixelBuffer
+    // ---------- два клика по центрам угловых клеток ----------
+    class PointPickForm : Form
     {
-        readonly byte[] data; readonly int w, h, stride;
-        public PixelBuffer(Bitmap bmp)
-        {
-            w = bmp.Width; h = bmp.Height;
-            var bd = bmp.LockBits(new Rectangle(0, 0, w, h), ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
-            stride = bd.Stride;
-            data = new byte[stride * h];
-            Marshal.Copy(bd.Scan0, data, 0, data.Length);
-            bmp.UnlockBits(bd);
-        }
-        public Color Get(int x, int y)
-        {
-            if (x < 0) x = 0; if (y < 0) y = 0;
-            if (x >= w) x = w - 1; if (y >= h) y = h - 1;
-            int i = y * stride + x * 4;
-            return Color.FromArgb(data[i + 2], data[i + 1], data[i]);
-        }
-    }
+        public Point P1, P2;
+        int clicks;
 
-    // ---------- Решатель ----------
-    static class Solver
-    {
-        public class Result { public HashSet<int> Safe = new HashSet<int>(); public HashSet<int> Mines = new HashSet<int>(); }
-
-        public static Result Solve(int[,] g, int R, int C)
-        {
-            var res = new Result();
-            bool changed = true;
-            while (changed)
-            {
-                changed = false;
-                var cons = new List<(HashSet<int> unk, int rem)>();
-
-                for (int r = 0; r < R; r++)
-                    for (int c = 0; c < C; c++)
-                    {
-                        int n = g[r, c];
-                        if (n <= 0) continue;
-                        var unk = new HashSet<int>();
-                        int known = 0;
-                        for (int dr = -1; dr <= 1; dr++)
-                            for (int dc = -1; dc <= 1; dc++)
-                            {
-                                if (dr == 0 && dc == 0) continue;
-                                int rr = r + dr, cc = c + dc;
-                                if (rr < 0 || cc < 0 || rr >= R || cc >= C) continue;
-                                if (g[rr, cc] != -1) continue;
-                                int id = rr * C + cc;
-                                if (res.Mines.Contains(id)) known++;
-                                else if (!res.Safe.Contains(id)) unk.Add(id);
-                            }
-                        int rem = n - known;
-                        if (unk.Count == 0) continue;
-                        if (rem == 0) { foreach (var u in unk) changed |= res.Safe.Add(u); }
-                        else if (rem == unk.Count) { foreach (var u in unk) changed |= res.Mines.Add(u); }
-                        else cons.Add((unk, rem));
-                    }
-
-                // правило подмножеств
-                for (int i = 0; i < cons.Count; i++)
-                    for (int j = 0; j < cons.Count; j++)
-                    {
-                        if (i == j) continue;
-                        var a = cons[i]; var b = cons[j];
-                        if (a.unk.Count >= b.unk.Count || !a.unk.IsSubsetOf(b.unk)) continue;
-                        var diff = b.unk.Where(x => !a.unk.Contains(x)).ToList();
-                        int rem = b.rem - a.rem;
-                        if (rem == 0) foreach (var d in diff) changed |= res.Safe.Add(d);
-                        else if (rem == diff.Count) foreach (var d in diff) changed |= res.Mines.Add(d);
-                    }
-            }
-            return res;
-        }
-    }
-
-    // ---------- Выбор области ----------
-    class SelectForm : Form
-    {
-        Point start; Rectangle rect; bool drag;
-        public Rectangle Selected => rect;
-
-        public SelectForm()
+        public PointPickForm()
         {
             FormBorderStyle = FormBorderStyle.None;
-            Bounds = SystemInformation.VirtualScreen;
             StartPosition = FormStartPosition.Manual;
+            Bounds = SystemInformation.VirtualScreen;
             TopMost = true;
-            Opacity = 0.3;
+            Opacity = 0.35;
             BackColor = Color.Black;
             Cursor = Cursors.Cross;
             DoubleBuffered = true;
             KeyPreview = true;
-            KeyDown += (s, e) => { if (e.KeyCode == Keys.Escape) DialogResult = DialogResult.Cancel; };
-            MouseDown += (s, e) => { start = e.Location; drag = true; };
-            MouseMove += (s, e) =>
+            KeyDown += delegate (object s, KeyEventArgs e) { if (e.KeyCode == Keys.Escape) DialogResult = DialogResult.Cancel; };
+            MouseDown += delegate (object s, MouseEventArgs e)
             {
-                if (!drag) return;
-                rect = Rectangle.FromLTRB(Math.Min(start.X, e.X), Math.Min(start.Y, e.Y),
-                                          Math.Max(start.X, e.X), Math.Max(start.Y, e.Y));
-                Invalidate();
+                Point sp = PointToScreen(e.Location);
+                if (clicks == 0) { P1 = sp; clicks = 1; Invalidate(); }
+                else
+                {
+                    P2 = sp;
+                    if (P2.X <= P1.X || P2.Y <= P1.Y) { clicks = 0; Invalidate(); return; }
+                    DialogResult = DialogResult.OK;
+                }
             };
-            MouseUp += (s, e) =>
+            Paint += delegate (object s, PaintEventArgs e)
             {
-                drag = false;
-                rect.Offset(Bounds.Location);
-                DialogResult = rect.Width > 20 && rect.Height > 20 ? DialogResult.OK : DialogResult.Cancel;
+                string msg = clicks == 0
+                    ? "Кликни в ЦЕНТР ЛЕВОЙ ВЕРХНЕЙ клетки поля  (Esc - отмена)"
+                    : "Теперь кликни в ЦЕНТР ПРАВОЙ НИЖНЕЙ клетки поля";
+                using (var font = new Font("Segoe UI", 20, FontStyle.Bold))
+                {
+                    SizeF sz = e.Graphics.MeasureString(msg, font);
+                    e.Graphics.DrawString(msg, font, Brushes.White, (ClientSize.Width - sz.Width) / 2, 60);
+                }
+                if (clicks == 1)
+                {
+                    Point c = PointToClient(P1);
+                    e.Graphics.FillEllipse(Brushes.Lime, c.X - 5, c.Y - 5, 10, 10);
+                }
             };
-            Paint += (s, e) => { if (drag) e.Graphics.DrawRectangle(Pens.Lime, rect); };
         }
     }
 
-    // ---------- Прозрачный оверлей (клики проходят сквозь него) ----------
+    // ---------- прозрачный оверлей: клики проходят сквозь него ----------
     class OverlayForm : Form
     {
         const int WS_EX_LAYERED = 0x80000, WS_EX_TRANSPARENT = 0x20, WS_EX_TOOLWINDOW = 0x80, WS_EX_NOACTIVATE = 0x08000000;
-        const uint WDA_EXCLUDEFROMCAPTURE = 0x11;
-        [DllImport("user32.dll")] static extern bool SetWindowDisplayAffinity(IntPtr hWnd, uint affinity);
 
-        public bool ExcludedFromCapture;
-        int rows, cols;
+        public static readonly Color SafeColor = Color.FromArgb(0, 255, 0);
+        public static readonly Color MineColor = Color.FromArgb(255, 60, 60);
+
+        public bool ShowTest;
+        BoardModel model;
         HashSet<int> safe = new HashSet<int>(), mines = new HashSet<int>();
 
         public OverlayForm()
@@ -341,39 +342,50 @@ namespace MineHint
         {
             get
             {
-                var cp = base.CreateParams;
+                CreateParams cp = base.CreateParams;
                 cp.ExStyle |= WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
                 return cp;
             }
         }
-        protected override bool ShowWithoutActivation => true;
+
+        protected override bool ShowWithoutActivation { get { return true; } }
 
         protected override void OnHandleCreated(EventArgs e)
         {
             base.OnHandleCreated(e);
-            try { ExcludedFromCapture = SetWindowDisplayAffinity(Handle, WDA_EXCLUDEFROMCAPTURE); }
-            catch { ExcludedFromCapture = false; }
+            Native.ExcludeFromCapture(Handle);
         }
 
-        public void Setup(Rectangle area) { Bounds = area; }
-
-        public void Update(int r, int c, HashSet<int> s, HashSet<int> m)
+        public void Setup(Rectangle area, BoardModel m)
         {
-            rows = r; cols = c; safe = s; mines = m;
+            model = m;
+            Bounds = area;
+        }
+
+        public void SetMarks(HashSet<int> s, HashSet<int> m)
+        {
+            safe = s; mines = m;
             Invalidate();
+        }
+
+        void Mark(Graphics g, Brush b, int id)
+        {
+            int r = id / model.Cols, c = id % model.Cols;
+            int sx = model.CellX(c), sy = model.CellY(r);
+            int w = model.CellW, h = model.CellH;
+            g.FillRectangle(b, sx + w / 4, sy + h / 4, Math.Max(4, w / 2), Math.Max(4, h / 2));
         }
 
         protected override void OnPaint(PaintEventArgs e)
         {
             base.OnPaint(e);
-            float cw = Width / (float)cols, ch = Height / (float)rows;
-            using (var pg = new Pen(Color.Lime, 3))
-            using (var pr = new Pen(Color.Red, 3))
+            if (model == null) return;
+            using (var bs = new SolidBrush(SafeColor))
+            using (var bm = new SolidBrush(MineColor))
             {
-                foreach (int id in safe)
-                    e.Graphics.DrawRectangle(pg, (id % cols) * cw + 2, (id / cols) * ch + 2, cw - 4, ch - 4);
-                foreach (int id in mines)
-                    e.Graphics.DrawRectangle(pr, (id % cols) * cw + 2, (id / cols) * ch + 2, cw - 4, ch - 4);
+                foreach (int id in safe) Mark(e.Graphics, bs, id);
+                foreach (int id in mines) Mark(e.Graphics, bm, id);
+                if (ShowTest) Mark(e.Graphics, bs, 0);
             }
         }
     }
