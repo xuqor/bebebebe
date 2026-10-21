@@ -244,6 +244,15 @@ namespace MineHint
         // ---------- основной цикл ----------
         void Tick()
         {
+            if (Bounds.IntersectsWith(area))
+            {
+                // окно закрывает поле - клетки под ним прочитаются неверно, поэтому не гадаем
+                overlay.SetMarks(new HashSet<int>(), new HashSet<int>());
+                status.Text = "Окно MineHint закрывает поле. Передвинь его в сторону, подсветка на паузе.";
+                prevBuf = null; dirty = false;
+                return;
+            }
+
             Frame f;
             try
             {
@@ -267,7 +276,7 @@ namespace MineHint
 
             int open = 0;
             for (int r = 0; r < modelRows; r++)
-                for (int c = 0; c < modelCols; c++) if (candidate[r, c] >= 0) open++;
+                for (int c = 0; c < modelCols; c++) if (candidate[r, c] != -1) open++;
             if (open == 0)
             {
                 overlay.SetMarks(new HashSet<int>(), new HashSet<int>());
@@ -285,10 +294,16 @@ namespace MineHint
                 return;
             }
             overlay.SetMarks(res.Safe, res.Mines);
+            int unknown = 0;
+            for (int r = 0; r < modelRows; r++)
+                for (int c = 0; c < modelCols; c++) if (candidate[r, c] == -2) unknown++;
             if (res.Safe.Count == 0 && res.Mines.Count == 0)
                 status.Text = "Надёжных ходов нет, нужно угадывать.";
             else
                 status.Text = "Безопасных клеток (зелёные): " + res.Safe.Count + "\r\nМин (красные): " + res.Mines.Count;
+            if (unknown > 0)
+                status.Text += "\r\nНе узнал цифру в клетках: " + unknown + " (другой цвет), они пропущены. " +
+                               "Пришли скриншот этих цифр, добавлю цвета.";
         }
     }
 

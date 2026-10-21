@@ -49,18 +49,13 @@ namespace MineHint
         int[] bandDx, bandDy;
         int[][] templates;
 
-        // цвета цифр классического сапёра (1..8)
-        static readonly int[] Palette =
+        // Цвета цифр. Первые 8 - классический сапёр, дальше - тёмная тема (цвета измерены по скриншоту).
+        // Если у цифры другой цвет, клетка помечается -2 («открыта, число неизвестно») - это безопасно для решателя.
+        static readonly int[] PalDigit = { 1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3 };
+        static readonly int[] PalColor =
         {
-            0,
-            0x0000FF, // 1 синий
-            0x008000, // 2 зелёный
-            0xFF0000, // 3 красный
-            0x000080, // 4 тёмно-синий
-            0x800000, // 5 бордовый
-            0x008080, // 6 бирюзовый
-            0x000000, // 7 чёрный
-            0x808080, // 8 серый
+            0x0000FF, 0x008000, 0xFF0000, 0x000080, 0x800000, 0x008080, 0x000000, 0x808080,
+            0x7CC7FF, 0x66C266, 0xFF7788,
         };
 
         static int Rnd(double v) { return (int)Math.Floor(v + 0.5); }
@@ -209,7 +204,7 @@ namespace MineHint
         }
 
         // ---------- распознавание ----------
-        // -1 закрыта, 0 открыта пустая, 1..8 число
+        // -1 закрыта, 0 открыта пустая, 1..8 число, -2 открыта, но цифру не узнали
         int Classify(Frame f, int r, int c)
         {
             int sx = CellX(c), sy = CellY(r);
@@ -222,17 +217,36 @@ namespace MineHint
             var counts = new int[9];
             int x0 = sx + (int)(CellW * 0.2), x1 = sx + (int)(CellW * 0.8);
             int y0 = sy + (int)(CellH * 0.2), y1 = sy + (int)(CellH * 0.8);
+            int bg = Background(f, x0, y0, x1 - 1, y1 - 1);
+            int ink = 0;
             for (int y = y0; y < y1; y++)
                 for (int x = x0; x < x1; x++)
                 {
                     int p = f.Get(x, y);
-                    for (int n = 1; n <= 8; n++)
-                        if (Col.Sq(p, Palette[n]) <= 2304) { counts[n]++; break; }
+                    bool matched = false;
+                    for (int i = 0; i < PalColor.Length; i++)
+                        if (Col.Sq(p, PalColor[i]) <= 2304) { counts[PalDigit[i]]++; matched = true; break; }
+                    if (!matched && Col.Sq(p, bg) > 6400) ink++;
                 }
             int best = 0, bestCount = 2;
             for (int n = 1; n <= 8; n++)
                 if (counts[n] > bestCount) { bestCount = counts[n]; best = n; }
-            return best;
+            if (best > 0) return best;
+            return ink >= 5 ? -2 : 0;       // есть «рисунок», но цвет не из палитры - число неизвестно
+        }
+
+        // цвет фона открытой клетки: берём тот угол окна, который совпадает с большинством остальных
+        static int Background(Frame f, int xa, int ya, int xb, int yb)
+        {
+            int[] c = { f.Get(xa, ya), f.Get(xb, ya), f.Get(xa, yb), f.Get(xb, yb) };
+            int bestI = 0, bestN = -1;
+            for (int i = 0; i < 4; i++)
+            {
+                int n = 0;
+                for (int j = 0; j < 4; j++) if (j != i && Col.Sq(c[i], c[j]) <= 900) n++;
+                if (n > bestN) { bestN = n; bestI = i; }
+            }
+            return c[bestI];
         }
 
         public int[,] ReadGrid(Frame f)

@@ -14,7 +14,7 @@ namespace MineHint
     {
         class Cons { public int[] Cells; public int Rem; }
 
-        // g[r,c]: -1 = закрыта, 0..8 = открытая клетка с числом
+        // g[r,c]: -1 = закрыта, 0..8 = открытая клетка с числом, -2 = открыта, число неизвестно (пропускается)
         // Возвращает только 100% надёжные выводы. При противоречии (ошибка распознавания)
         // возвращает Inconsistent = true и пустые множества.
         public static SolveResult Solve(int[,] g, int rows, int cols)
