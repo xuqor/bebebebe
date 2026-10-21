@@ -69,10 +69,22 @@ namespace MineHint
         public int CellY(int r) { return Rnd(OriginY + r * PitchY); }
 
         // ---------- калибровка ----------
-        // hintOx/hintOy - примерное положение левого верхнего угла поля в кадре, hintPx/hintPy - примерный размер клетки
-        public static BoardModel Calibrate(Frame f, int cols, int rows,
-                                           double hintOx, double hintOy, double hintPx, double hintPy,
-                                           out string error)
+        // Область по двум кликам (левая верхняя и правая нижняя клетки; можно кликать куда угодно в них).
+        // Берём запас вокруг, чтобы поле точно поместилось.
+        public static bool AreaFromClicks(int x1, int y1, int x2, int y2, int cols, int rows,
+                                          out int ax, out int ay, out int aw, out int ah,
+                                          out double pEstX, out double pEstY)
+        {
+            pEstX = (x2 - x1) / (double)cols;
+            pEstY = (y2 - y1) / (double)rows;
+            int mx = (int)(Math.Abs(pEstX) * 1.5) + 12, my = (int)(Math.Abs(pEstY) * 1.5) + 12;
+            ax = x1 - mx; ay = y1 - my;
+            aw = (x2 - x1) + 2 * mx; ah = (y2 - y1) + 2 * my;
+            return pEstX >= 6 && pEstY >= 6 && pEstX <= 80 && pEstY <= 80;
+        }
+
+        // pEstX/pEstY - грубая оценка размера клетки (точную находим сами по границам клеток)
+        public static BoardModel Calibrate(Frame f, int cols, int rows, double pEstX, double pEstY, out string error)
         {
             error = null;
             int W = f.W, H = f.H;
@@ -96,8 +108,8 @@ namespace MineHint
                 }
 
             double px, ox, py, oy;
-            Fit(colE, W, cols, hintPx, hintOx, out px, out ox);
-            Fit(rowE, H, rows, hintPy, hintOy, out py, out oy);
+            Fit(colE, W, cols, pEstX, out px, out ox);
+            Fit(rowE, H, rows, pEstY, out py, out oy);
 
             var m = new BoardModel();
             m.Cols = cols; m.Rows = rows;
@@ -107,13 +119,13 @@ namespace MineHint
             m.FrameW = W; m.FrameH = H;
             if (m.CellW < 8 || m.CellH < 8)
             {
-                error = "Клетки слишком маленькие, проверь, что кликнул в центры клеток.";
+                error = "Клетки слишком маленькие. Проверь число столбцов и строк в окне.";
                 return null;
             }
             if (m.CellX(0) < 0 || m.CellY(0) < 0 ||
                 m.CellX(cols - 1) + m.CellW > W || m.CellY(rows - 1) + m.CellH > H)
             {
-                error = "Поле не помещается в область. Проверь число столбцов/строк и клики по центрам угловых клеток.";
+                error = "Сетка не поместилась в область. Проверь число столбцов и строк и кликни в левую верхнюю и правую нижнюю клетки.";
                 return null;
             }
 
@@ -153,26 +165,27 @@ namespace MineHint
             {
                 error = "Поле не похоже на полностью закрытое (совпадение клеток " + (int)(m.Match * 100) +
                         "%, клетка " + m.CellW + "x" + m.CellH + " px). Начни новую игру, не открывай клетки " +
-                        "и кликни точно в центры угловых клеток.";
+                        "и кликни в левую верхнюю и правую нижнюю клетки.";
                 return null;
             }
             return m;
         }
 
-        static void Fit(double[] E, int len, int n, double hintP, double hintO,
-                        out double bestPitch, out double bestOrigin)
+        // Ищем размер клетки и положение сетки: сумма «энергии границ» в узлах сетки должна быть максимальной.
+        // Берём n+1 узлов (обе внешние границы поля), так сетку не сдвинуть на целую клетку.
+        static void Fit(double[] E, int len, int n, double pEst, out double bestPitch, out double bestOrigin)
         {
             double best = double.MinValue;
-            bestPitch = hintP; bestOrigin = hintO;
-            double pSpan = Math.Max(0.5, 7.0 / Math.Max(1, n - 1));
-            double oSpan = 6.0;
-            for (double p = hintP - pSpan; p <= hintP + pSpan + 1e-9; p += 0.05)
+            bestPitch = pEst; bestOrigin = 0;
+            for (double p = pEst * 0.65; p <= pEst * 1.6 + 1e-9; p += 0.05)
             {
                 if (p < 6) continue;
-                for (double o = hintO - oSpan; o <= hintO + oSpan + 1e-9; o += 0.5)
+                double oMax = len - 2 - n * p;      // всё поле должно поместиться в кадр
+                if (oMax < 1) continue;
+                for (double o = 0; o <= oMax + 1e-9; o += 0.5)
                 {
                     double sum = 0;
-                    for (int k = 0; k < n; k++)
+                    for (int k = 0; k <= n; k++)
                     {
                         int x = Rnd(o + k * p);
                         if (x < 1 || x >= len) continue;

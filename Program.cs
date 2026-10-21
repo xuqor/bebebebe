@@ -82,8 +82,8 @@ namespace MineHint
 
             status.SetBounds(10, 140, 300, 120);
             status.Text = "Размер поля: новичок 9x9, любитель 16x16, эксперт 30 столбцов x 16 строк.\r\n\r\n" +
-                          "Начни НОВУЮ игру (все клетки закрыты), нажми кнопку 1 и кликни в центр левой верхней, " +
-                          "а потом в центр правой нижней клетки.";
+                          "Начни НОВУЮ игру (все клетки закрыты), нажми кнопку 1 и кликни в левую верхнюю клетку, " +
+                          "а потом в правую нижнюю.";
 
             Controls.Add(l1); Controls.Add(numCols); Controls.Add(l2); Controls.Add(numRows);
             Controls.Add(btnPick); Controls.Add(btnRun); Controls.Add(status);
@@ -118,21 +118,16 @@ namespace MineHint
             Application.DoEvents();
             Thread.Sleep(350);          // дать экрану перерисоваться без затемнения
 
-            double pX = (p2.X - p1.X) / (double)(cols - 1);
-            double pY = (p2.Y - p1.Y) / (double)(rows - 1);
-            if (pX < 8 || pY < 8 || pX > 80 || pY > 80)
+            int ax, ay, aw, ah;
+            double pX, pY;
+            if (!BoardModel.AreaFromClicks(p1.X, p1.Y, p2.X, p2.Y, cols, rows, out ax, out ay, out aw, out ah, out pX, out pY))
             {
                 Show();
                 Fail("Размер клеток получился странным (" + pX.ToString("F1") + " x " + pY.ToString("F1") +
-                     " px). Проверь число столбцов/строк и кликни именно в центры угловых клеток: " +
-                     "сначала левая верхняя, потом правая нижняя.");
+                     " px). Проверь число столбцов/строк в окне и кликни сначала в левую верхнюю клетку, " +
+                     "потом в правую нижнюю.");
                 return;
             }
-
-            const int AM = 12;          // запас вокруг поля
-            int ax = (int)Math.Floor(p1.X - pX / 2 - AM), ay = (int)Math.Floor(p1.Y - pY / 2 - AM);
-            int aw = (int)Math.Round(cols * pX + 2 * AM), ah = (int)Math.Round(rows * pY + 2 * AM);
-            double hOx = (p1.X - pX / 2) - ax, hOy = (p1.Y - pY / 2) - ay;
             area = new Rectangle(ax, ay, aw, ah);
 
             Frame f;
@@ -140,7 +135,7 @@ namespace MineHint
             catch (Exception ex) { Show(); Fail("Не удалось сделать снимок экрана: " + ex.Message); return; }
 
             string err;
-            BoardModel m = BoardModel.Calibrate(f, cols, rows, hOx, hOy, pX, pY, out err);
+            BoardModel m = BoardModel.Calibrate(f, cols, rows, pX, pY, out err);
             Show();
             if (m == null)
             {
@@ -297,7 +292,7 @@ namespace MineHint
         }
     }
 
-    // ---------- два клика по центрам угловых клеток ----------
+    // ---------- два клика: левая верхняя и правая нижняя клетки ----------
     class PointPickForm : Form
     {
         public Point P1, P2;
@@ -329,8 +324,8 @@ namespace MineHint
             Paint += delegate (object s, PaintEventArgs e)
             {
                 string msg = clicks == 0
-                    ? "Кликни в ЦЕНТР ЛЕВОЙ ВЕРХНЕЙ клетки поля  (Esc - отмена)"
-                    : "Теперь кликни в ЦЕНТР ПРАВОЙ НИЖНЕЙ клетки поля";
+                    ? "Кликни в ЛЕВУЮ ВЕРХНЮЮ клетку поля  (Esc - отмена)"
+                    : "Теперь кликни в ПРАВУЮ НИЖНЮЮ клетку поля";
                 using (var font = new Font("Segoe UI", 20, FontStyle.Bold))
                 {
                     SizeF sz = e.Graphics.MeasureString(msg, font);
